@@ -6,7 +6,7 @@ import { requestFaceFrame } from '../face/request.js';
 import { resolveUploadPuid } from './client-info.js';
 import { captureMonitorFrame } from './frame.js';
 import { rewriteObjectIds } from './rewrite.js';
-import { pageUploadContext, uploadMonitorFrame, type MonitorUploadResult } from './upload.js';
+import { pageUploadContext, uploadMonitorFrame, type MonitorUploadContext, type MonitorUploadResult } from './upload.js';
 
 /**
  * 上报伪造结果：拦下客户端的监控回复，把其中的 objectId 换成我们上传的伪造截屏。
@@ -19,12 +19,10 @@ import { pageUploadContext, uploadMonitorFrame, type MonitorUploadResult } from 
  * 「合成 → 上传 → 改写 → 重新分发」。任何一步失败都把**原包**原样放回去，监控流程不会因为插件缺条回复。
  */
 
-/** 会被改写的协议：客户端在这些回复里带回 objectId。 */
+/** 仅替换截屏回复；人脸取帧回复必须透传，避免合成时再次触发自身。 */
 export const MONITOR_PROTOCOLS = [
     'CLIENT_SCREEN_MONITOR',
-    'CLIENT_SNAPSHOT',
-    'CLIENT_FACE_COLLECTION',
-    'CLIENT_FACE_RECOGNITION_BLINK'
+    'CLIENT_SNAPSHOT'
 ];
 
 /** 合成器：产出整屏伪造帧。 */
@@ -32,7 +30,7 @@ export type FrameComposer = () => Promise<HTMLCanvasElement>;
 /** 上传器：把伪造帧送上去，换回 objectId。 */
 export type FrameUploader = (frame: Blob) => Promise<MonitorUploadResult>;
 
-/** 一次替换的结果，供面板与日志展示。 */
+/** 一次替换的结果，供日志与测试使用。 */
 export interface ReplacementEvent {
     protocol: string;
     /** 成功指"换成了自己的 id 并重新分发"。 */
@@ -59,11 +57,18 @@ export interface MonitorReplacementOptions {
 const REPLAYED = new WeakSet<object>();
 
 /** 给 Promise 加超时，避免合成或上传卡住后监控回复永远不发。 */
-function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
-    return Promise.race([
-        promise,
-        new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${what}超时`)), ms))
-    ]);
+async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${what}超时`)), ms);
+            })
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /** 默认合成器：向客户端要一帧真实画面，再拼出整屏。 */
@@ -77,10 +82,11 @@ async function defaultCompose(): Promise<HTMLCanvasElement> {
 }
 
 /** 默认上传器：云盘接口，`puid` 先看页面再问客户端。 */
-async function defaultUpload(frame: Blob): Promise<MonitorUploadResult> {
+async function defaultUpload(frame: Blob, context: MonitorUploadContext): Promise<MonitorUploadResult> {
     const puid = await resolveUploadPuid();
     return uploadMonitorFrame(frame, {
         ...pageUploadContext(),
+        ...context,
         puid: puid.value ?? undefined,
         puidSource: puid.source,
         puidTried: puid.tried
@@ -97,10 +103,29 @@ export function installMonitorFrameReplacement(
     options: MonitorReplacementOptions = {}
 ): () => void {
     const compose = options.compose ?? defaultCompose;
-    const upload = options.upload ?? defaultUpload;
     const timeoutMs = options.timeoutMs ?? 20_000;
+    // 按协议保存页面发给客户端的上传上下文，不依赖已删除的探针流量记录。
+    const uploadContexts = new Map<string, MonitorUploadContext>();
+    const stopContext = jsBridge.use('prePostNotification', (ctx, next) => {
+        const args = ctx.args as { name?: string; payload?: {
+            uploadParams?: Record<string, unknown>;
+            uploadConfig?: { uploadUrl?: string };
+        } };
+        if (args.name && MONITOR_PROTOCOLS.includes(args.name) && args.payload) {
+            const params: Record<string, string> = {};
+            for (const [key, value] of Object.entries(args.payload.uploadParams ?? {})) {
+                if (typeof value === 'string' || typeof value === 'number') params[key] = String(value);
+            }
+            const context: MonitorUploadContext = { params };
+            if (args.payload.uploadConfig?.uploadUrl) context.uploadUrl = args.payload.uploadConfig.uploadUrl;
+            uploadContexts.set(args.name, context);
+        }
+        next();
+    }, { name: 'sw4c-monitor-upload-context' });
 
     const replace = async (protocol: string, payload: Record<string, unknown>): Promise<void> => {
+        const context = uploadContexts.get(protocol) ?? {};
+        const upload = options.upload ?? ((frame: Blob) => defaultUpload(frame, context));
         const startedAt = Date.now();
         const finish = (event: Omit<ReplacementEvent, 'protocol' | 'elapsedMs'>): void => {
             options.onEvent?.({ protocol, elapsedMs: Date.now() - startedAt, ...event });
@@ -134,7 +159,7 @@ export function installMonitorFrameReplacement(
         }
     };
 
-    return jsBridge.use(
+    const stopReplacement = jsBridge.use(
         'preTrigger',
         (ctx, next) => {
             const args = ctx.args as { name?: string; userInfo?: unknown };
@@ -160,4 +185,9 @@ export function installMonitorFrameReplacement(
         },
         { name: 'sw4c-monitor-replacement', priority: 100 }
     );
+    return () => {
+        stopReplacement();
+        stopContext();
+        uploadContexts.clear();
+    };
 }

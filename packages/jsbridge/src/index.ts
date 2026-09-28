@@ -14,7 +14,7 @@ import { requestFaceFrame } from './face/request.js';
 import { interceptorKeyboard, interceptorSwitch, interceptorTitle } from './interceptors/derestrict.js';
 import { interceptorProxyAdapter } from './interceptors/proxy_adapter.js';
 import { captureMonitorFrame } from './monitor/frame.js';
-import { faceProbeEnabled, installFaceProbe } from './probe/face-probe.js';
+import { installMonitorFrameReplacement } from './monitor/replace.js';
 import { jsBridgeEnv, leftButtonIconUrl } from './utils/env.js';
 import { rewriteUrl } from './utils/proxy_url.js';
 
@@ -51,7 +51,6 @@ export {
     startBridgeRecorder,
     type BridgeLogEntry
 } from './debug/recorder.js';
-export { faceProbeEnabled, installFaceProbe, type FaceProbeApi, type FaceProbeReport } from './probe/face-probe.js';
 
 // 提前建好环境对象，后续拦截器回调不必再判空。
 jsBridgeEnv();
@@ -64,13 +63,8 @@ jsBridge.use('prePostNotification', interceptorTitle);
 // 客户端发给页面的回复。
 jsBridge.use('preTrigger', interceptorSwitch);
 
-/**
- * 人脸悬浮窗探针。
- *
- * 默认不运行：只有 `localStorage['sw4c-face-probe'] = '1'` 或 URL 里带 `sw4c_face_probe`
- * 时才自动开始。需要单独注入时用 `dist/face-probe.js`。
- */
-const faceProbe = installFaceProbe();
+// 默认安装截屏上报替换；不创建探针面板，不自动发起协议探测。
+export const stopMonitorFrameReplacement = installMonitorFrameReplacement();
 
 /**
  * 控制台 API。
@@ -90,5 +84,5 @@ const faceProbe = installFaceProbe();
     startBridgeRecorder,
     dumpBridgeLog,
     clearBridgeLog,
-    faceProbe
+    stopMonitorFrameReplacement
 };

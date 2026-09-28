@@ -255,8 +255,9 @@ describe('上报替换管线', () => {
 
         const out = await target.evaluate(async () => {
             const lib = (window as any).__Lib__;
+            lib.stopMonitorFrameReplacement();
             const seen: any[] = [];
-            (window as any).jsBridge.bind('CLIENT_FACE_COLLECTION', (payload: any) => seen.push(payload));
+            (window as any).jsBridge.bind('CLIENT_SCREEN_MONITOR', (payload: any) => seen.push(payload));
 
             const events: any[] = [];
             const uninstall = lib.installMonitorFrameReplacement({
@@ -277,7 +278,7 @@ describe('上报替换管线', () => {
             });
 
             // 模拟客户端触发一次带画面引用的回复。
-            (window as any).jsBridge.trigger('CLIENT_FACE_COLLECTION', {
+            (window as any).jsBridge.trigger('CLIENT_SCREEN_MONITOR', {
                 data: {
                     frontObjectId: 'eb22bddf7ffee338164f3ca4e8df5702',
                     backObjectId: '06c639617c223448960c0a9d04cff465',
@@ -314,6 +315,7 @@ describe('上报替换管线', () => {
 
         const out = await target.evaluate(async () => {
             const lib = (window as any).__Lib__;
+            lib.stopMonitorFrameReplacement();
             const seen: any[] = [];
             (window as any).jsBridge.bind('CLIENT_SCREEN_MONITOR', (payload: any) => seen.push(payload));
 
@@ -348,6 +350,7 @@ describe('上报替换管线', () => {
 
         const out = await target.evaluate(async () => {
             const lib = (window as any).__Lib__;
+            lib.stopMonitorFrameReplacement();
             const seen: any[] = [];
             (window as any).jsBridge.bind('CLIENT_SCREEN_MONITOR', (payload: any) => seen.push(payload));
             const events: any[] = [];
@@ -372,79 +375,61 @@ describe('上报替换管线', () => {
     }, 30_000);
 });
 
-describe('探针的合成钩子', () => {
-    test('提供 compose 时面板出现合成按钮并能出图', async () => {
-        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
-        await target.goto(`${ORIGIN()}/`);
+describe('默认入口', () => {
+    test('不创建探针面板，也不主动发起人脸探测', async () => {
+        const target = await browser.newPage();
+        await target.goto(`${ORIGIN()}/?sw4c_face_probe=1`);
         await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
-
-        const out = await target.evaluate(async () => {
-            (window as any).jsBridge.device = 'android';
-            const probe = (window as any).__Lib__.installFaceProbe({
-                autoRun: false,
-                waitScale: 0.05,
-                includeScreenMonitor: false,
-                objectIdUrl: (id: string) => `/face.png?objectId=${id}`,
-                // 桩合成器：真实实现会调 fake-screen，这里只验证探针把画面交了出去。
-                compose: async (face: any) => {
-                    (window as any).__composeArg__ = face ? { w: face.naturalWidth, h: face.naturalHeight } : null;
-                    const canvas = document.createElement('canvas');
-                    canvas.width = 1080;
-                    canvas.height = 2400;
-                    return canvas;
-                }
-            });
-
-            const beforeRun = probe.canCompose();
-            await probe.run({ waitScale: 0.05, includeScreenMonitor: false });
-            const shadow = document.getElementById('sw4c-face-probe-panel')!.shadowRoot!;
-            const sectionVisible = !(shadow.getElementById('composeSection') as HTMLElement).hidden;
-            const outcome = await probe.composeFrame();
-            return {
-                beforeRun,
-                sectionVisible,
-                outcome,
-                composeArg: (window as any).__composeArg__,
-                previews: shadow.getElementById('composeOut')!.querySelectorAll('img').length,
-                reportCompose: (probe.report() as any).compose
-            };
-        });
-
-        expect(out.beforeRun).toBe(true);
-        expect(out.sectionVisible).toBe(true);
-        expect(out.outcome).toMatchObject({ ok: true, width: 1080, height: 2400 });
-        expect(out.outcome.bytes).toBeGreaterThan(1000);
-        // 探针把真机取到的那张脸交给了合成器。
-        expect(out.composeArg).toEqual({ w: 54, h: 96 });
-        expect(out.previews).toBe(1);
-        expect(out.reportCompose?.ok).toBe(true);
+        await target.waitForTimeout(200);
+        expect(await target.locator('#sw4c-face-probe-panel').count()).toBe(0);
+        const state = await target.evaluate(() => ({
+            probe: typeof (window as any).__SW4C_FACE_PROBE__,
+            requests: (window as any).__toClient__
+        }));
+        expect(state.probe).toBe('undefined');
+        expect(state.requests).toHaveLength(0);
         await target.close();
-    }, 30_000);
+    });
 
-    test('没有 compose 时不显示合成按钮', async () => {
+    test('默认接入合成上传，摄像头取帧回复不会递归进入替换', async () => {
         const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
-        await target.goto(`${ORIGIN()}/`);
+        let uploads = 0;
+        await target.addInitScript(() => {
+            (window as any).__CIFERA__ = { h: location.host, s: 'http' };
+        });
+        await target.route('**/star3/origin/**', (route) =>
+            route.fulfill({ body: Buffer.from(FACE_PNG), contentType: 'image/png' }));
+        await target.route('**/upload?*', async (route) => {
+            uploads++;
+            expect(new URL(route.request().url()).searchParams.get('uploadtype')).toBe('screen');
+            expect(route.request().postDataBuffer()?.includes(Buffer.from('image/jpeg'))).toBe(true);
+            await route.fulfill({
+                contentType: 'application/json',
+                body: JSON.stringify({ data: { objectId: 'ffffffffffffffffffffffffffffffff' } })
+            });
+        });
+        await target.goto(`${ORIGIN()}/?puid=123456`);
         await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
-
         const out = await target.evaluate(async () => {
-            const probe = (window as any).__Lib__.installFaceProbe({ autoRun: false, includeScreenMonitor: false });
-            for (let i = 0; i < 50 && !document.getElementById('sw4c-face-probe-panel'); i++) {
+            const bridge = (window as any).jsBridge;
+            bridge.device = 'android';
+            bridge.postNotification('CLIENT_SCREEN_MONITOR', {
+                uploadConfig: { uploadUrl: location.origin + '/upload' },
+                uploadParams: { uploadtype: 'screen' }
+            });
+            const seen: any[] = [];
+            bridge.bind('CLIENT_SCREEN_MONITOR', (payload: any) => seen.push(payload));
+            bridge.trigger('CLIENT_SCREEN_MONITOR', {
+                data: { captureObjectId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }
+            });
+            for (let i = 0; i < 200 && seen.length === 0; i++) {
                 await new Promise((resolve) => setTimeout(resolve, 100));
             }
-            const shadow = document.getElementById('sw4c-face-probe-panel')!.shadowRoot!;
-            const outcome = await probe.composeFrame();
-            return {
-                canCompose: probe.canCompose(),
-                hidden: (shadow.getElementById('composeSection') as HTMLElement).hidden,
-                outcomeOk: outcome.ok,
-                error: outcome.error
-            };
+            return { seen, requests: (window as any).__toClient__ };
         });
-
-        expect(out.canCompose).toBe(false);
-        expect(out.hidden).toBe(true);
-        expect(out.outcomeOk).toBe(false);
-        expect(out.error).toContain('未提供');
+        expect(out.seen).toEqual([{ data: { captureObjectId: 'ffffffffffffffffffffffffffffffff' } }]);
+        expect(uploads).toBe(1);
+        expect(out.requests.filter((r: any) => r.name === 'CLIENT_FACE_COLLECTION' && r.payload.enable === '1')).toHaveLength(1);
         await target.close();
     }, 30_000);
 });
