@@ -126,7 +126,8 @@ beforeAll(async () => {
                        window.__toClient__.push({ name: name, payload: JSON.parse(payload) });
                        if (name === 'CLIENT_FACE_COLLECTION') {
                          var payloadObj = JSON.parse(payload);
-                         if (payloadObj.enable === '1') {
+                         // 客户端用 optInt 判定，字符串与数字都算；桩也照做。
+                         if (String(payloadObj.enable) === '1') {
                            setTimeout(function () {
                              window.jsBridge.trigger('CLIENT_FACE_COLLECTION', ${JSON.stringify(REAL_REPLY)});
                            }, 10);
@@ -247,6 +248,31 @@ describe('requestFaceFrame 的取图失败降级', () => {
     }, 30_000);
 });
 
+describe('键盘限制拦截', () => {
+    test('CLIENT_LIMIT_KEYBOARD 不抵达客户端，并补一个 {result:1} 回包', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.goto(`${ORIGIN()}/`);
+        await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
+
+        const out = await target.evaluate(async () => {
+            (window as any).jsBridge.device = 'android';
+            const replies: any[] = [];
+            (window as any).jsBridge.bind('CLIENT_LIMIT_KEYBOARD', (payload: any) => replies.push(payload));
+            (window as any).jsBridge.postNotification('CLIENT_LIMIT_KEYBOARD', { enable: 1 });
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            return {
+                replies,
+                toClient: (window as any).__toClient__.map((entry: any) => entry.name)
+            };
+        });
+
+        // 页面拿到了“健康值”，而客户端根本没收到这条协议（不会去改系统默认输入法）。
+        expect(out.replies).toEqual([{ result: 1 }]);
+        expect(out.toClient).not.toContain('CLIENT_LIMIT_KEYBOARD');
+        await target.close();
+    }, 30_000);
+});
+
 describe('上报替换管线', () => {
     test('把客户端回复里的 objectId 换成自己上传的 id 后重新分发', async () => {
         const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
@@ -302,7 +328,8 @@ describe('上报替换管线', () => {
         expect(out.seen).toHaveLength(1);
         expect(out.seen[0].data.frontObjectId).toBe('ffffffffffffffffffffffffffffffff');
         expect(out.seen[0].data.backObjectId).toBe('ffffffffffffffffffffffffffffffff');
-        expect(out.seen[0].signToken).toBe('keepme');
+        // 换 id 后原签名必然失配，因此 signToken 被移除；cxcid/cxtime 等非签名字段保留。
+        expect(out.seen[0].signToken).toBeUndefined();
         expect(out.seen[0].cxcid).toBe('keepme');
         await target.close();
     }, 30_000);
@@ -341,6 +368,141 @@ describe('上报替换管线', () => {
         await target.close();
     }, 30_000);
 
+    test('回复用内联 base64 时也换成我们上传的画面', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.goto(`${ORIGIN()}/`);
+        await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
+
+        const out = await target.evaluate(async () => {
+            const lib = (window as any).__Lib__;
+            const seen: any[] = [];
+            (window as any).jsBridge.bind('CLIENT_SNAPSHOT', (payload: any) => seen.push(payload));
+
+            const events: any[] = [];
+            const uninstall = lib.installMonitorFrameReplacement({
+                compose: async () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 540;
+                    canvas.height = 960;
+                    canvas.getContext('2d').fillRect(0, 0, 540, 960);
+                    return canvas;
+                },
+                upload: async () => ({
+                    ok: true,
+                    objectId: 'e'.repeat(32),
+                    status: 200,
+                    body: '{}',
+                    url: 'https://pan-yz.chaoxing.com/upload'
+                }),
+                onEvent: (event: any) => events.push(event)
+            });
+
+            (window as any).jsBridge.trigger('CLIENT_SNAPSHOT', {
+                type: 3,
+                captureStatus: 1,
+                files: [{ name: 'shot.jpg', type: 'image/jpeg', data: 'A'.repeat(200) }]
+            });
+
+            for (let i = 0; i < 80 && events.length === 0; i++) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            uninstall();
+            return { seen, events };
+        });
+
+        expect(out.events[0]).toMatchObject({ ok: true });
+        expect(out.seen).toHaveLength(1);
+        // 真实画面被换成长串 base64，且结构化字段保留。
+        expect(out.seen[0].files[0].data.length).toBeGreaterThan(200);
+        expect(out.seen[0].files[0].data).not.toBe('A'.repeat(200));
+        expect(out.seen[0].files[0].name).toBe('shot.jpg');
+        expect(out.seen[0].type).toBe(3);
+        await target.close();
+    }, 30_000);
+
+    test('重复安装只注册一次拦截器，事件不会重复', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.goto(`${ORIGIN()}/`);
+        await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
+
+        const out = await target.evaluate(async () => {
+            const lib = (window as any).__Lib__;
+            (window as any).jsBridge.device = 'android';
+            let events = 0;
+            let composes = 0;
+            const upload = async () => ({
+                ok: true,
+                objectId: 'a'.repeat(32),
+                status: 200,
+                body: '{}',
+                url: 'x'
+            });
+            lib.installMonitorFrameReplacement({
+                compose: async () => {
+                    composes++;
+                    return document.createElement('canvas');
+                },
+                upload,
+                onEvent: () => events++
+            });
+            lib.installMonitorFrameReplacement({ upload, onEvent: () => events++ });
+
+            (window as any).jsBridge.trigger('CLIENT_SCREEN_MONITOR', {
+                data: { objectId: 'b'.repeat(32) }
+            });
+            for (let i = 0; i < 60 && events < 2; i++) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            lib.uninstallMonitorFrameReplacement();
+            return { events, composes, installed: lib.isMonitorReplacementInstalled() };
+        });
+
+        // 两个订阅者各收到一次事件（订阅可以重复，拦截器不会重复）。
+        expect(out.events).toBe(2);
+        expect(out.composes).toBe(1);
+        expect(out.installed).toBe(false);
+        await target.close();
+    }, 30_000);
+
+    test('人脸回复里的真实画面被复用为悬浮窗内容', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.goto(`${ORIGIN()}/`);
+        await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
+
+        const out = await target.evaluate(async () => {
+            const lib = (window as any).__Lib__;
+            (window as any).jsBridge.device = 'android';
+            let composedWith: any = null;
+            const events: any[] = [];
+            lib.installMonitorFrameReplacement({
+                // 把人脸地址指到本地桩图，验证“从回复的 objectId 取真实画面”这条链路。
+                objectIdUrl: (id: string) => `/face.png?objectId=${id}`,
+                compose: async (face: HTMLImageElement | null) => {
+                    composedWith = face ? { w: face.naturalWidth, h: face.naturalHeight } : null;
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 540;
+                    canvas.height = 960;
+                    return canvas;
+                },
+                upload: async () => ({ ok: true, objectId: 'c'.repeat(32), status: 200, body: '{}', url: 'x' }),
+                onEvent: (event: any) => events.push(event)
+            });
+
+            (window as any).jsBridge.trigger('CLIENT_FACE_COLLECTION', {
+                data: { frontObjectId: 'eb22bddf7ffee338164f3ca4e8df5702', backObjectId: 'd'.repeat(32) }
+            });
+            for (let i = 0; i < 60 && events.length === 0; i++) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            lib.uninstallMonitorFrameReplacement();
+            return { composedWith, events };
+        });
+
+        expect(out.composedWith).toEqual({ w: 54, h: 96 });
+        expect(out.events[0]).toMatchObject({ ok: true });
+        await target.close();
+    }, 30_000);
+
     test('纯状态回复不进替换流程', async () => {
         const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
         await target.goto(`${ORIGIN()}/`);
@@ -375,6 +537,10 @@ describe('上报替换管线', () => {
 describe('探针的合成钩子', () => {
     test('提供 compose 时面板出现合成按钮并能出图', async () => {
         const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        // 人脸采集步骤带风险，会先弹确认；测试按“同意”处理。
+        await target.addInitScript(() => {
+            (window as any).confirm = () => true;
+        });
         await target.goto(`${ORIGIN()}/`);
         await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
 

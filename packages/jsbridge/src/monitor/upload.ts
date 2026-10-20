@@ -129,6 +129,78 @@ export function pageUploadContext(root?: Document): MonitorUploadContext {
     };
 }
 
+/** 从监控请求里回收的上传上下文。 */
+export interface HarvestedUpload {
+    /** 合并后的查询参数（`uploadParams` 与 `faceUploadParam`）。 */
+    params: Record<string, string>;
+    /** 页面给的 `uploadConfig.uploadUrl`；后端按场次注入，优先于隐藏输入与云盘中心。 */
+    uploadUrl?: string;
+    isYunPan?: boolean;
+    fid?: string;
+    isMirror?: number;
+}
+
+/** 只出现在上传参数里的键。 */
+const UPLOAD_PARAM_KEYS = ['uploadParams', 'faceUploadParam'] as const;
+
+/** 把对象或 JSON 字符串统一读成对象；不是对象返回 null。 */
+function asRecord(value: unknown): Record<string, unknown> | null {
+    if (value && typeof value === 'object') return value as Record<string, unknown>;
+    if (typeof value === 'string' && value.trim().startsWith('{')) {
+        try {
+            const parsed = JSON.parse(value) as unknown;
+            return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
+
+/**
+ * 从页面发过的监控请求里回收上传上下文。
+ *
+ * 客户端 7.0.4 的字段位置并不统一：`CLIENT_SCREEN_MONITOR` 把 `uploadParams` / `uploadConfig` 放在顶层，
+ * 而 `CLIENT_FACE_COLLECTION` 与 `CLIENT_SNAPSHOT` 放在 `data` 里。只读顶层会漏掉后两者，导致上传时缺少
+ * `uploadtype` 这类业务参数。`uploadConfig` 本身还是 JSON 字符串，需要解析后才能拿到 `uploadUrl`
+ * （客户端就是用它决定上传去哪的）。
+ *
+ * @param payloads - 依次传入的请求载荷，后出现的覆盖先出现的同名参数。
+ */
+export function harvestUploadContext(payloads: unknown[]): HarvestedUpload {
+    const result: HarvestedUpload = { params: {} };
+
+    for (const payload of payloads) {
+        const root = asRecord(payload);
+        if (!root) continue;
+
+        for (const container of [root, asRecord(root.data)]) {
+            if (!container) continue;
+
+            for (const key of UPLOAD_PARAM_KEYS) {
+                const params = asRecord(container[key]);
+                if (!params) continue;
+                for (const [name, value] of Object.entries(params)) {
+                    if (typeof value === 'string' || typeof value === 'number') {
+                        result.params[name] = String(value);
+                    }
+                }
+            }
+
+            const config = asRecord(container.uploadConfig);
+            if (!config) continue;
+            if (typeof config.uploadUrl === 'string' && config.uploadUrl.trim()) {
+                result.uploadUrl = config.uploadUrl.trim();
+            }
+            if (typeof config.fid === 'string' && config.fid.trim()) result.fid = config.fid.trim();
+            if (config.isYunPan !== undefined) result.isYunPan = Number(config.isYunPan) === 1;
+            if (config.isMirror !== undefined) result.isMirror = Number(config.isMirror);
+        }
+    }
+
+    return result;
+}
+
 /** 按上下文拼出实际上传地址。 */
 function resolveUploadUrl(context: MonitorUploadContext): string {
     if (context.uploadUrl) return context.uploadUrl;

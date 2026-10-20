@@ -170,9 +170,13 @@ beforeAll(async () => {
                        import * as Probe from '/probe-lib.js';
                        window.__Probe__ = Probe;
                      </script>`;
+            const examMarkers = url.searchParams.get('exam')
+                ? '<input type="hidden" id="testUserRelationId" value="167239306">'
+                : '';
             return new Response(
                 `<!doctype html><html><head><meta charset="utf-8">
-                 <script>${STUB_BRIDGE}</script>${page}</head><body><h1>探针测试页</h1></body></html>`,
+                 <script>${STUB_BRIDGE}</script>${page}</head>
+                 <body><h1>探针测试页</h1>${examMarkers}</body></html>`,
                 { headers: { 'content-type': 'text/html' } }
             );
         }
@@ -194,6 +198,10 @@ async function runProbe(
     includeScreenMonitor = true
 ): Promise<{ report: any; sent: { name: string; payload: any }[]; panel: () => Promise<any> }> {
     const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+    // 有副作用的步骤会先弹确认，测试里按“用户同意”处理。
+    await target.addInitScript(() => {
+        (window as any).confirm = () => true;
+    });
     await target.goto(`${ORIGIN()}/`);
     await target.waitForFunction(() => (window as any).__Probe__ !== undefined);
 
@@ -233,6 +241,9 @@ async function runProbe(
 describe('人脸探针', () => {
     test('独立入口注入后自动发送第一个采集请求', async () => {
         const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.addInitScript(() => {
+            (window as any).confirm = () => true;
+        });
         await target.goto(`${ORIGIN()}/?standalone=1`);
         await target.waitForFunction(() => (window as any).__SW4C_FACE_PROBE__ !== undefined);
         await target.waitForFunction(() => ((window as any).__sent__ || []).length > 0, null, { timeout: 10_000 });
@@ -242,8 +253,8 @@ describe('人脸探针', () => {
             device: (window as any).jsBridge.device
         }));
         expect(first.sent.name).toBe('CLIENT_FACE_COLLECTION');
-        expect(first.sent.payload.enable).toBe('1');
-        expect(first.sent.payload.enableCapture).toBe('1');
+        expect(first.sent.payload.enable).toBe(1);
+        expect(first.sent.payload.enableCapture).toBe(1);
         // 桩 bridge 是 ios 且存在 androidjsbridge，探针应改为 android 走注入对象通道。
         expect(first.device).toBe('android');
         await target.close();
@@ -306,6 +317,9 @@ describe('人脸探针', () => {
 
     test('注入即生效入口：无需任何开关就自动运行，且只建一个面板', async () => {
         const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.addInitScript(() => {
+            (window as any).confirm = () => true;
+        });
         await target.goto(`${ORIGIN()}/?withBridge=1`);
         await target.waitForFunction(() => (window as any).__SW4C_FACE_PROBE__ !== undefined);
         await target.waitForFunction(() => ((window as any).__native__ || []).length > 0, null, { timeout: 10_000 });
@@ -321,8 +335,68 @@ describe('人脸探针', () => {
         expect(state.panels).toBe(1);
         expect(state.hasStudyWolf).toBe(true);
         expect(state.first.n).toBe('CLIENT_FACE_COLLECTION');
-        expect(JSON.parse(state.first.p).enable).toBe('1');
+        expect(JSON.parse(state.first.p).enable).toBe(1);
         expect(state.textareaHasReport).toBeGreaterThan(200);
+        await target.close();
+    }, 30_000);
+
+    test('非考试页拒绝确认时跳过有副作用的步骤', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.addInitScript(() => {
+            (window as any).confirm = () => false;
+        });
+        await target.goto(`${ORIGIN()}/`);
+        await target.waitForFunction(() => (window as any).__Probe__ !== undefined);
+
+        const out = await target.evaluate(async () => {
+            const probe = (window as any).__Probe__.installFaceProbe({
+                autoRun: false,
+                waitScale: 0.02,
+                includeScreenMonitor: false
+            });
+            const report = await probe.run({ waitScale: 0.02, includeScreenMonitor: false });
+            return { steps: report.steps, sent: (window as any).__sent__ };
+        });
+
+        // 带风险的三个步骤被跳过（人脸采集两条 + 活体采集），不带风险的抓拍照常发送。
+        expect(out.steps.slice(0, 3).every((step: any) => !!step.skipped)).toBe(true);
+        expect(out.steps[0].skipped).toContain('用户取消');
+        expect(out.steps[3].skipped).toBeUndefined();
+        // 关键：CLIENT_FACE_COLLECTION / FACE_RECOGNITION_BLINK 一条都没发给客户端。
+        expect(out.sent.map((entry: any) => entry.name)).toEqual(['CLIENT_SNAPSHOT']);
+        await target.close();
+    }, 30_000);
+
+    test('考试页不弹确认，直接发送', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.addInitScript(() => {
+            (window as any).__confirmCalls__ = 0;
+            (window as any).confirm = () => {
+                (window as any).__confirmCalls__++;
+                return false;
+            };
+        });
+        await target.goto(`${ORIGIN()}/?exam=1`);
+        await target.waitForFunction(() => (window as any).__Probe__ !== undefined);
+
+        const out = await target.evaluate(async () => {
+            const probe = (window as any).__Probe__.installFaceProbe({
+                autoRun: false,
+                waitScale: 0.02,
+                includeScreenMonitor: false
+            });
+            const report = await probe.run({ waitScale: 0.02, includeScreenMonitor: false });
+            return {
+                confirmCalls: (window as any).__confirmCalls__,
+                sent: (window as any).__sent__.map((entry: any) => entry.name),
+                firstSkipped: report.steps[0]?.skipped ?? null
+            };
+        });
+
+        // 页面里有考试标记 -> 不确认，且第一步照发。
+        expect(out.confirmCalls).toBe(0);
+        expect(out.firstSkipped).toBeNull();
+        expect(out.sent[0]).toBe('CLIENT_FACE_COLLECTION');
         await target.close();
     }, 30_000);
 
@@ -347,19 +421,6 @@ describe('人脸探针', () => {
         expect(outcome.sameInstance).toBe(true);
         expect(outcome.globalIsFirst).toBe(true);
         expect(outcome.panels).toBe(1);
-        await target.close();
-    }, 30_000);
-
-    test('原生接口自检把异常变成可读文本', async () => {
-        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
-        await target.goto(`${ORIGIN()}/`);
-        await target.waitForFunction(() => (window as any).__Probe__ !== undefined);
-        const outcome = await target.evaluate(() => {
-            const probe = (window as any).__Probe__.installFaceProbe({ autoRun: false });
-            return { title: probe.callNative('getTitle'), missing: probe.callNative('notThere') };
-        });
-        expect(outcome.title).toContain('stub');
-        expect(outcome.missing).toContain('不可用');
         await target.close();
     }, 30_000);
 });

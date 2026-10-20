@@ -14,6 +14,12 @@ import { requestFaceFrame } from './face/request.js';
 import { interceptorKeyboard, interceptorSwitch, interceptorTitle } from './interceptors/derestrict.js';
 import { interceptorProxyAdapter } from './interceptors/proxy_adapter.js';
 import { captureMonitorFrame } from './monitor/frame.js';
+import {
+    installMonitorFrameReplacement,
+    isMonitorReplacementInstalled,
+    subscribeMonitorReplacement,
+    uninstallMonitorFrameReplacement
+} from './monitor/replace.js';
 import { faceProbeEnabled, installFaceProbe } from './probe/face-probe.js';
 import { jsBridgeEnv, leftButtonIconUrl } from './utils/env.js';
 import { rewriteUrl } from './utils/proxy_url.js';
@@ -35,6 +41,9 @@ export { requestClientUserInfo, resolveUploadPuid } from './monitor/client-info.
 export {
     MONITOR_PROTOCOLS,
     installMonitorFrameReplacement,
+    isMonitorReplacementInstalled,
+    subscribeMonitorReplacement,
+    uninstallMonitorFrameReplacement,
     type MonitorReplacementOptions,
     type ReplacementEvent
 } from './monitor/replace.js';
@@ -65,6 +74,21 @@ jsBridge.use('prePostNotification', interceptorTitle);
 jsBridge.use('preTrigger', interceptorSwitch);
 
 /**
+ * 上报伪造：默认常驻。
+ *
+ * 每一次监控回复都会被换成我们合成、自己上传的截屏。需要临时关掉时在控制台里设
+ * `localStorage['sw4c-monitor-hijack'] = '0'` 并刷新，或用 `__STUDY_WOLF__.uninstallMonitorFrameReplacement()`。
+ */
+const monitorHijackDisabled = (() => {
+    try {
+        return localStorage.getItem('sw4c-monitor-hijack') === '0';
+    } catch {
+        return false;
+    }
+})();
+if (!monitorHijackDisabled) installMonitorFrameReplacement();
+
+/**
  * 人脸悬浮窗探针。
  *
  * 默认不运行：只有 `localStorage['sw4c-face-probe'] = '1'` 或 URL 里带 `sw4c_face_probe`
@@ -90,5 +114,9 @@ const faceProbe = installFaceProbe();
     startBridgeRecorder,
     dumpBridgeLog,
     clearBridgeLog,
-    faceProbe
+    faceProbe,
+    installMonitorFrameReplacement,
+    uninstallMonitorFrameReplacement,
+    isMonitorReplacementInstalled,
+    subscribeMonitorReplacement
 };

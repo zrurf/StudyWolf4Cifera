@@ -1,6 +1,11 @@
 import '../index.js';
 import { captureMonitorFrame } from '../monitor/frame.js';
-import { installMonitorFrameReplacement } from '../monitor/replace.js';
+import {
+    installMonitorFrameReplacement,
+    isMonitorReplacementInstalled,
+    subscribeMonitorReplacement,
+    uninstallMonitorFrameReplacement
+} from '../monitor/replace.js';
 import { installFaceProbe } from './face-probe.js';
 
 /**
@@ -31,14 +36,22 @@ const composeFrame = async (face: HTMLImageElement | null): Promise<HTMLCanvasEl
 (window as unknown as { __SW4C_FACE_PROBE_COMPOSE__?: typeof composeFrame }).__SW4C_FACE_PROBE_COMPOSE__ =
     composeFrame;
 
+// 上报劫持的订阅句柄：探针开关只负责订阅/退订与启停，管线本身由 index.ts 常驻安装。
+let offReplacement: (() => void) | null = null;
+
 installFaceProbe({
     autoRun: true,
     // 复用探针已经拿到的那张画面，不再重复向客户端要图。
     compose: composeFrame,
-    // 上报劫持：拦下客户端的监控回复，换成我们上传的伪造截屏（合成也用同一张人脸画面）。
-    replace: (onEvent) =>
-        installMonitorFrameReplacement({
-            compose: () => composeFrame(lastFace),
-            onEvent
-        })
+    startReplace: (onEvent) => {
+        offReplacement?.();
+        offReplacement = subscribeMonitorReplacement(onEvent);
+        installMonitorFrameReplacement();
+    },
+    stopReplace: () => {
+        offReplacement?.();
+        offReplacement = null;
+        uninstallMonitorFrameReplacement();
+    },
+    replaceActive: () => isMonitorReplacementInstalled()
 });

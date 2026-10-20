@@ -1,6 +1,7 @@
 import type { Callback } from '@study-wolf-cifera/shared-types';
 
 import { jsBridge } from '../bridge.js';
+import { withMonitorReplacementSuppressed } from '../monitor/suppression.js';
 import { rewriteUrl } from '../utils/proxy_url.js';
 import { DEFAULT_OBJECT_ID_URL, findFrameCandidate, loadReadableImage } from './frame.js';
 
@@ -48,6 +49,12 @@ const REPLY_PROTOCOLS = ['CLIENT_FACE_COLLECTION', 'CLIENT_FACE_RECOGNITION_BLIN
  * 画面时返回 `image: null`，由调用方决定是否退化为占位图。
  */
 export async function requestFaceFrame(request: FaceFrameRequest = {}): Promise<FaceFrameResult> {
+    // 客户端对 CLIENT_FACE_COLLECTION 的回复不能被上报替换拦走，否则这里会一直等到超时。
+    return withMonitorReplacementSuppressed(() => requestFaceFrameInner(request));
+}
+
+/** {@link requestFaceFrame} 的主体，外层只负责开抑制窗口。 */
+async function requestFaceFrameInner(request: FaceFrameRequest = {}): Promise<FaceFrameResult> {
     const {
         timeoutMs = 30_000,
         internalTimeMs = 1000,

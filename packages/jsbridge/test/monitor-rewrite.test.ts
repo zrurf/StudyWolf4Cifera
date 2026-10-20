@@ -3,8 +3,13 @@
  */
 import { describe, expect, test } from 'bun:test';
 
-import { findPuidInReply, rewriteObjectIds } from '../src/monitor/rewrite.js';
-import { resolvePuid } from '../src/monitor/upload.js';
+import {
+    findPuidInReply,
+    hasInlineImageFiles,
+    rewriteInlineImages,
+    rewriteObjectIds
+} from '../src/monitor/rewrite.js';
+import { harvestUploadContext, resolvePuid } from '../src/monitor/upload.js';
 
 /** 真机回包的形状（docs/chaoxing.txt）。 */
 const REAL_REPLY = {
@@ -86,5 +91,72 @@ describe('resolvePuid', () => {
         // 尝试过隐藏输入与地址参数；cxcid 尾部不可靠，已刻意不做猜测。
         expect(resolved.tried).toContain('input:userId');
         expect(resolved.tried).not.toContain('cxcid');
+    });
+});
+
+describe('harvestUploadContext', () => {
+    test('CLIENT_SCREEN_MONITOR：上传参数与 uploadConfig 在顶层', () => {
+        const harvested = harvestUploadContext([
+            {
+                enable: 1,
+                uploadParams: { uploadtype: 'examkeeper', fid: 'abc' },
+                uploadConfig: JSON.stringify({ uploadUrl: 'https://exam.example.com/upload?sign=1' })
+            }
+        ]);
+
+        expect(harvested.params).toEqual({ uploadtype: 'examkeeper', fid: 'abc' });
+        expect(harvested.uploadUrl).toBe('https://exam.example.com/upload?sign=1');
+    });
+
+    test('CLIENT_FACE_COLLECTION：7.0.4 把上传参数放进 data', () => {
+        const harvested = harvestUploadContext([
+            {
+                enable: '1',
+                data: {
+                    internalTime: 10000,
+                    uploadParams: '{"uploadtype":"face_temp"}',
+                    faceUploadParam: { uploadtype: 'face_temp' },
+                    uploadConfig: '{"isYunPan":1,"fid":"fid123","isMirror":0}'
+                }
+            }
+        ]);
+
+        expect(harvested.params).toEqual({ uploadtype: 'face_temp' });
+        expect(harvested).toMatchObject({ isYunPan: true, fid: 'fid123', isMirror: 0 });
+    });
+
+    test('后出现的参数覆盖先出现的；空载荷被忽略', () => {
+        const harvested = harvestUploadContext([
+            null,
+            { uploadParams: { uploadtype: 'old' } },
+            { data: { uploadParams: { uploadtype: 'new' } } }
+        ]);
+        expect(harvested.params.uploadtype).toBe('new');
+    });
+});
+
+describe('内联 base64 画面', () => {
+    const inlineReply = () => ({
+        type: 3,
+        captureStatus: 1,
+        files: [
+            { name: 'a.jpg', type: 'image/jpeg', data: 'A'.repeat(120) },
+            { name: 'b.jpg', type: 'image/jpeg', data: 'B'.repeat(120) }
+        ]
+    });
+
+    test('识别出 files[].data 里的 base64', () => {
+        expect(hasInlineImageFiles(inlineReply())).toBe(true);
+        expect(hasInlineImageFiles({ data: { objectId: 'a'.repeat(32) } })).toBe(false);
+        expect(hasInlineImageFiles({ files: 'file:///tmp/a.jpg' })).toBe(false);
+    });
+
+    test('替换成自己的画面并保留其它字段', () => {
+        const payload = inlineReply();
+        expect(rewriteInlineImages(payload, 'MYIMAGE')).toBe(2);
+        expect(payload.files[0].data).toBe('MYIMAGE');
+        expect(payload.files[1].data).toBe('MYIMAGE');
+        expect(payload.files[0].name).toBe('a.jpg');
+        expect(payload.type).toBe(3);
     });
 });

@@ -75,3 +75,99 @@ export function rewriteObjectIds(payload: unknown, objectId: string): number {
 
     return replaced;
 }
+
+/**
+ * 移除载荷里的 `signToken`。
+ *
+ * 客户端的签名是对它自己的 objectId 计算的；我们把 id 换掉之后原签名必然失配，留着只会让服务端判定
+ * “签名错误”，删掉等同于旧版客户端的不带签名上报。
+ *
+ * @returns 移除的字段数。
+ */
+export function dropSignatureFields(payload: unknown): number {
+    let removed = 0;
+    const queue: unknown[] = [payload];
+    const seen = new Set<unknown>();
+
+    while (queue.length) {
+        const current = queue.shift();
+        if (!current || typeof current !== 'object' || seen.has(current)) continue;
+        seen.add(current);
+
+        const record = current as Record<string, unknown>;
+        if (typeof record.signToken === 'string') {
+            delete record.signToken;
+            removed++;
+        }
+        for (const value of Object.values(record)) {
+            if (value && typeof value === 'object') queue.push(value);
+        }
+    }
+
+    return removed;
+}
+
+/**
+ * 回复里是否带内联图片。
+ *
+ * 客户端 7.0.4 的 `CLIENT_SNAPSHOT` 有一部分路径不回 objectId，而是把图片 base64 直接塞进
+ * `files[].data` 交给页面。这种回复同样要换成伪造帧，否则页面拿到的是真实画面。
+ */
+export function hasInlineImageFiles(payload: unknown): boolean {
+    const queue: unknown[] = [payload];
+    const seen = new Set<unknown>();
+
+    while (queue.length) {
+        const current = queue.shift();
+        if (!current || typeof current !== 'object' || seen.has(current)) continue;
+        seen.add(current);
+        const record = current as Record<string, unknown>;
+        const files = record.files;
+        if (Array.isArray(files)) {
+            for (const file of files) {
+                const entry = file as Record<string, unknown> | null;
+                if (entry && typeof entry.data === 'string' && entry.data.length > 64) return true;
+            }
+        }
+        for (const value of Object.values(record)) {
+            if (value && typeof value === 'object') queue.push(value);
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 把 `files[].data` 里的 base64 图片换掉。
+ *
+ * 只改 `files` 数组里的 `data` 字符串，其它结构（`name`/`type`、以及路径字符串形态的 `files`）保持原样。
+ *
+ * @returns 替换的条目数。
+ */
+export function rewriteInlineImages(payload: unknown, base64: string): number {
+    let replaced = 0;
+    const queue: unknown[] = [payload];
+    const seen = new Set<unknown>();
+
+    while (queue.length) {
+        const current = queue.shift();
+        if (!current || typeof current !== 'object' || seen.has(current)) continue;
+        seen.add(current);
+        const record = current as Record<string, unknown>;
+
+        if (Array.isArray(record.files)) {
+            for (const file of record.files) {
+                const entry = file as Record<string, unknown> | null;
+                if (!entry || typeof entry.data !== 'string' || entry.data.length <= 64) continue;
+                entry.data = base64;
+                replaced++;
+            }
+        }
+
+        for (const value of Object.values(record)) {
+            if (value && typeof value === 'object') queue.push(value);
+        }
+    }
+
+    return replaced;
+}

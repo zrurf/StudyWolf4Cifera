@@ -2,7 +2,14 @@ import { DEFAULT_OBJECT_ID_URL, findFrameCandidate, loadReadableImage } from '..
 // 只取类型与纯函数：探针必须能独立注入，不能把 bridge、构图模块或 SnapDOM 一起拖进产物。
 import type { ReplacementEvent } from '../monitor/replace.js';
 import { findPuidInReply } from '../monitor/rewrite.js';
-import { pageUploadContext, resolvePuid, uploadMonitorFrame, type MonitorUploadResult } from '../monitor/upload.js';
+import { beginMonitorReplacementSuppression } from '../monitor/suppression.js';
+import {
+    harvestUploadContext,
+    pageUploadContext,
+    resolvePuid,
+    uploadMonitorFrame,
+    type MonitorUploadResult
+} from '../monitor/upload.js';
 
 /**
  * 人脸悬浮窗唤起探针。
@@ -26,6 +33,10 @@ export interface FaceProbeOptions {
     waitScale?: number;
     /** 是否显示页面面板；默认 true。 */
     panel?: boolean;
+    /**
+     * 有副作用的步骤在非考试页发送前弹确认（防被客户端关页），默认 true。
+     */
+    confirmRisky?: boolean;
     /** 由 objectId 构造图片地址；默认用 {@link DEFAULT_OBJECT_ID_URL}。 */
     objectIdUrl?: (objectId: string) => string;
     /**
@@ -34,10 +45,12 @@ export interface FaceProbeOptions {
      */
     compose?: (face: HTMLImageElement | null) => Promise<HTMLCanvasElement>;
     /**
-     * 上报劫持的可选钩子：宿主传入后，面板上会多出开关；返回卸载函数。探针自己不实现替换，因为那会
-     * 把 bridge 与构图模块一起打进独立探针产物。
+     * 上报劫持的三个可选钩子：宿主传入后，面板上会多出开关。探针自身不实现替换（那会把 bridge 与构图
+     * 模块一起打进独立探针产物），只负责订阅事件与启停常驻管线。
      */
-    replace?: (onEvent: (event: ReplacementEvent) => void) => () => void;
+    startReplace?: (onEvent: (event: ReplacementEvent) => void) => void;
+    stopReplace?: () => void;
+    replaceActive?: () => boolean;
 }
 
 /** 一个候选步骤。 */
@@ -49,6 +62,8 @@ interface ProbeStep {
     waitMs: number;
     /** 这一步在验证什么。 */
     note: string;
+    /** 有副作用、可能干扰当前页时写明原因；发送前会按需二次确认。 */
+    risky?: string;
 }
 
 /** 客户端的一条回复。 */
@@ -72,6 +87,8 @@ interface StepResult {
     /** 找到画面时的证据：来源、可加载的地址、尺寸。 */
     image?: { source: string; value: string; loadUrl: string; width: number; height: number };
     error?: string;
+    /** 因风险被跳过时的原因（用户取消或判定不安全）。 */
+    skipped?: string;
 }
 
 /** 一条 bridge 流量。 */
@@ -150,10 +167,11 @@ export interface FaceProbeApi {
     canReplace: () => boolean;
     /** 开关"上报劫持"：开启后客户端的监控回复会被换成我们上传的伪造截屏。 */
     toggleReplacement: () => { installed: boolean; events: ReplacementEvent[] };
+    /** 读取/设置“有副作用的步骤发送前确认”。 */
+    confirmRisky: (value?: boolean) => boolean;
     /** 上报劫持是否已开启。 */
     replacementInstalled: () => boolean;
     fetchObjectId: (objectId: string) => Promise<{ url: string; ok: boolean; message: string }>;
-    callNative: (method: string) => string;
 }
 
 const STORAGE_ENABLE_KEY = 'sw4c-face-probe';
@@ -163,41 +181,61 @@ const MAX_TRAFFIC = 400;
 
 /** 候选步骤：从最可能唤起悬浮窗的采集开启，到录屏抓拍。 */
 function buildSteps(includeScreenMonitor: boolean): ProbeStep[] {
+    // 上传参数统一用 JSON 字符串：7.0.4 全部用 optString 读取（对象也能读成 JSON 文本，字符串是规范形态）。
+    const faceUpload = JSON.stringify({ uploadtype: 'face_temp' });
     const steps: ProbeStep[] = [
         {
             id: 'face-enable',
             label: '开启人脸采集',
             protocol: 'CLIENT_FACE_COLLECTION',
-            payload: { enable: '1', enableCapture: '1', data: { internalTime: '3000', funconfig: {} } },
+            payload: {
+                enable: 1,
+                // 3.6.x 用它，7.0.4 已忽略，留着兼容。
+                enableCapture: 1,
+                // 7.0.4 会把 <10000 的间隔抬到 10000。
+                data: { internalTime: 10_000, funconfig: {} }
+            },
             waitMs: 20_000,
-            note: '考试页关闭监控用的就是这条协议的 enable=0 形态；这里试 enable=1，看客户端是否启动采集与悬浮窗。'
+            note: '考试页关闭监控就是这条协议的 enable=0 形态；这里试 enable=1，看客户端是否启动采集与悬浮窗。',
+            risky: '客户端在“有进行中的监考考试且页面不一致”时会弹提示并关闭当前页'
         },
         {
             id: 'face-enable-upload',
             label: '开启人脸采集（带上传参数）',
             protocol: 'CLIENT_FACE_COLLECTION',
             payload: {
-                enable: '1',
-                enableCapture: '1',
-                data: { internalTime: '3000', funconfig: {} },
-                faceUploadParam: { uploadtype: 'face_temp' },
-                uploadParams: { uploadtype: 'face_temp' }
+                enable: 1,
+                enableCapture: 1,
+                data: {
+                    internalTime: 10_000,
+                    funconfig: {},
+                    // 7.0.4 从 data 里读（optString），3.6.x 读顶层；两处都给，字符串形态。
+                    uploadParams: faceUpload,
+                    faceUploadParam: faceUpload
+                },
+                uploadParams: faceUpload,
+                faceUploadParam: faceUpload
             },
             waitMs: 20_000,
-            note: '考试页的 supportCsUploadSwitch 会带上 uploadtype=face_temp，客户端可能以此判断是否处于考试场景。'
+            note: '考试页的 supportCsUploadSwitch 会带上 uploadtype=face_temp；7.0.4 把这两项放在 data 里。',
+            risky: '客户端在“有进行中的监考考试且页面不一致”时会弹提示并关闭当前页'
         },
         {
             id: 'face-blink',
             label: '人脸活体采集',
             protocol: 'CLIENT_FACE_RECOGNITION_BLINK',
             payload: {
+                // 7.0.4 的功能类型键是 funTag（CreateCourseActivity.G = "funTag"），1 = 采集；
+                // 3.6.x 用 funcType，两个都带。
+                funTag: 1,
                 funcType: 1,
                 recogType: 1,
-                uploadParams: { uploadtype: 'face_temp' },
-                faceUploadParam: { uploadtype: 'face_temp' }
+                uploadParams: faceUpload,
+                faceUploadParam: faceUpload
             },
             waitMs: 25_000,
-            note: 'funcType=1 在反编译代码里会启动人脸采集 Activity（全屏相机界面），回包里的 objectIdStr 是真实人脸图。'
+            note: 'funTag=1 会拉起全屏人脸采集界面；回包里的 objectIdStr / collectStatus 是真实采集结果。',
+            risky: '会拉起全屏相机界面，考试进行中不要点'
         },
         {
             id: 'snapshot',
@@ -215,18 +253,33 @@ function buildSteps(includeScreenMonitor: boolean): ProbeStep[] {
             label: '启动录屏抓拍（会上传整屏）',
             protocol: 'CLIENT_SCREEN_MONITOR',
             payload: {
-                enable: '1',
-                controlType: '0',
-                internalTime: '5000',
+                enable: 1,
+                controlType: 0,
+                internalTime: 5000,
                 funconfig: {},
-                uploadParams: { uploadtype: 'examkeeper' }
+                // cqf.execute 用 optString 读，字符串形态最稳。
+                uploadParams: JSON.stringify({ uploadtype: 'examkeeper' })
             },
             waitMs: 25_000,
-            note: '客户端用 MediaProjection 截取整屏，悬浮窗属于屏幕内容，因此抓拍图里应当能看到人脸窗；回复里的 objectId 就是整屏截图。'
+            note: '客户端用 MediaProjection 截取整屏，悬浮窗属于屏幕内容，因此抓拍图里应当能看到人脸窗；回复里的 objectId 就是整屏截图。',
+            risky: '会申请系统录屏授权并上传整屏'
         });
     }
 
     return steps;
+}
+
+/**
+ * 当前页面是否像考试页。
+ *
+ * 7.0.4 的 `CLIENT_FACE_COLLECTION` 在“存在进行中的监考考试、但调用方页面不是那个考试页”时会提示并
+ * 关闭当前页。考试页自身带有关系 id / 班级 id 这类隐藏字段，据此判断“页面与考试一致”，从而免去确认。
+ */
+function looksLikeExamPage(): boolean {
+    if (typeof document === 'undefined') return false;
+    const markers = ['testUserRelationId', 'examRelationId', 'examId', 'testPaperId', 'classId'];
+    if (markers.some((id) => !!document.getElementById(id))) return true;
+    return /(?:^|\/)(?:task-exam|exam-ans|do-exam)/i.test(location.pathname);
 }
 
 /** 探针是否被开关启用（localStorage 或 URL 参数）。 */
@@ -355,8 +408,6 @@ export function installFaceProbe(options: FaceProbeOptions = {}): FaceProbeApi {
         panel: null as ProbePanel | null,
         /** 最近一次成功取到的人脸画面，供「合成伪造帧」复用。 */
         lastFace: null as HTMLImageElement | null,
-        /** 已安装的替换管线卸载函数。 */
-        replacement: null as (() => void) | null,
         /** 替换事件流水。 */
         replacements: [] as ReplacementEvent[]
     };
@@ -430,7 +481,8 @@ export function installFaceProbe(options: FaceProbeOptions = {}): FaceProbeApi {
                 state,
                 startedAt,
                 { ...step, waitMs: Math.round(step.waitMs * scale) },
-                objectIdUrl()
+                objectIdUrl(),
+                settings.confirmRisky !== false
             );
             report.steps.push(result);
             state.panel?.render(report);
@@ -488,18 +540,22 @@ export function installFaceProbe(options: FaceProbeOptions = {}): FaceProbeApi {
                     waitMs,
                     note: '面板手动触发'
                 },
-                objectIdUrl()
+                objectIdUrl(),
+                settings.confirmRisky !== false
             );
         },
         canCompose: () => typeof settings.compose === 'function',
-        replacementInstalled: () => state.replacement !== null,
-        canReplace: () => typeof settings.replace === 'function',
+        confirmRisky: (value) => {
+            if (value !== undefined) settings.confirmRisky = value;
+            return settings.confirmRisky !== false;
+        },
+        replacementInstalled: () => settings.replaceActive?.() ?? false,
+        canReplace: () => typeof settings.startReplace === 'function',
         toggleReplacement: () => {
-            if (state.replacement) {
-                state.replacement();
-                state.replacement = null;
-            } else if (settings.replace) {
-                state.replacement = settings.replace((event) => {
+            if (api.replacementInstalled()) {
+                settings.stopReplace?.();
+            } else {
+                settings.startReplace?.((event) => {
                     state.replacements.push(event);
                     if (state.replacements.length > 50) state.replacements.shift();
                     if (state.report) {
@@ -509,7 +565,7 @@ export function installFaceProbe(options: FaceProbeOptions = {}): FaceProbeApi {
                     state.panel?.renderReplacementEvents();
                 });
             }
-            const installed = state.replacement !== null;
+            const installed = api.replacementInstalled();
             query<HTMLButtonElement>('replace').textContent = installed ? '关闭上报劫持' : '开启上报劫持';
             query<HTMLDivElement>('replaceOut').textContent = installed
                 ? '已开启：客户端的监控回复会被换成我们上传的伪造截屏'
@@ -522,14 +578,22 @@ export function installFaceProbe(options: FaceProbeOptions = {}): FaceProbeApi {
             // puid 先看页面线索（隐藏输入 / 地址参数），都没有就直接问客户端。
             const puid = await probeResolvePuid(state.bridge);
             const context = pageUploadContext();
-            // 页面自己发过的 uploadParams / faceUploadParam 直接透传，服务端靠它区分业务类型。
-            const harvested = harvestUploadParams(state.traffic);
+            // 页面自己发过的 uploadParams / uploadConfig 直接透传，服务端靠它区分业务类型、决定上传地址。
+            const harvested = harvestUploadContext(
+                state.traffic
+                    .filter((entry) => entry.direction === 'toClient')
+                    .map((entry) => entry.args[0])
+            );
             const result = await uploadMonitorFrame(frame.blob, {
                 ...context,
+                uploadUrl: harvested.uploadUrl ?? context.uploadUrl,
+                isYunPan: harvested.isYunPan,
+                fid: harvested.fid,
+                isMirror: harvested.isMirror,
                 puid: puid.value ?? context.puid,
                 puidSource: puid.source,
                 puidTried: puid.tried,
-                params: { ...harvested, ...(context.params ?? {}) }
+                params: { ...harvested.params, ...(context.params ?? {}) }
             });
             let fetchedBack = false;
             if (result.objectId) {
@@ -600,16 +664,10 @@ export function installFaceProbe(options: FaceProbeOptions = {}): FaceProbeApi {
                 return { url, ok: false, message: error instanceof Error ? error.message : String(error) };
             }
         },
-        callNative: (method) => {
-            const target = (window as any).androidjsbridge;
-            if (!target || typeof target[method] !== 'function') return `androidjsbridge.${method} 不可用`;
-            try {
-                const value = target[method]();
-                return `返回 ${typeof value}：${String(value).slice(0, 300)}`;
-            } catch (error) {
-                return `抛出：${error instanceof Error ? error.message : String(error)}`;
-            }
-        }
+        // 不再暴露 getTitle()/getFirstImage() 自检：7.0.4 里它们是 native → JS 的回调名
+        // （WebAppViewerFragment.ea()/V9() 会调 androidjsbridge.getFirstImage(src)），不是页面可调用的接口。
+        // 注入对象到底有哪些方法，环境区会直接列出 Object.keys(androidjsbridge)。
+
     };
 
     installed = api;
@@ -636,7 +694,8 @@ async function runStep(
     },
     startedAt: number,
     step: ProbeStep,
-    objectIdUrl: (objectId: string) => string
+    objectIdUrl: (objectId: string) => string,
+    confirmRisky = true
 ): Promise<StepResult> {
     const result: StepResult = {
         id: step.id,
@@ -654,6 +713,18 @@ async function runStep(
         return result;
     }
 
+    // 防关页：有副作用的步骤在非考试页先问一句，用户取消就整步跳过。
+    if (step.risky && confirmRisky && !looksLikeExamPage()) {
+        const message =
+            `即将发送 ${step.protocol}。\n\n风险：${step.risky}。\n\n继续发送吗？`;
+        if (typeof window.confirm === 'function' && !window.confirm(message)) {
+            result.skipped = `用户取消：${step.risky}`;
+            return result;
+        }
+    }
+
+    // 探针要看客户端原样回的回复，因此在等待窗口内让上报替换放行（否则会被替换管线吞掉）。
+    const releaseSuppression = beginMonitorReplacementSuppression();
     const stepStart = Date.now();
     const listener = (payload: unknown): void => {
         result.replies.push({
@@ -677,6 +748,8 @@ async function runStep(
         bridge.unbind(step.protocol, listener);
     } catch {
         // 解绑失败不影响结论。
+    } finally {
+        releaseSuppression();
     }
 
     // 客户端也可能在别的协议上回包（例如状态走 *_STATUS），统一从流量里补齐本步骤窗口内的回复。
@@ -788,25 +861,6 @@ async function probeResolvePuid(
     return { value: null, source: null, tried };
 }
 
-/** 从已记录的流量里回收页面自己发过的上传参数。 */
-function harvestUploadParams(traffic: TrafficEntry[]): Record<string, string> {
-    const merged: Record<string, string> = {};
-    for (const entry of traffic) {
-        if (entry.direction !== 'toClient') continue;
-        const payload = entry.args[0] as Record<string, unknown> | undefined;
-        if (!payload || typeof payload !== 'object') continue;
-        for (const key of ['uploadParams', 'faceUploadParam'] as const) {
-            const value = payload[key];
-            if (value && typeof value === 'object') {
-                for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-                    if (typeof v === 'string' || typeof v === 'number') merged[k] = String(v);
-                }
-            }
-        }
-    }
-    return merged;
-}
-
 /** 写回 localStorage，便于页面跳转后仍能取到记录。 */
 function persist(report: FaceProbeReport): void {
     try {
@@ -863,6 +917,7 @@ function createPanel(api: FaceProbeApi): ProbePanel {
           <section id="env"></section>
           <section id="steps"><div class="dim">等待开始</div></section>
           <section>
+            <label><input type="checkbox" id="confirmRisky" checked> 非考试页发送前确认（防关页）</label>
             <button id="full">全屏</button>
             <button id="copy">复制 JSON</button>
             <button id="rerun">重跑</button>
@@ -889,12 +944,6 @@ function createPanel(api: FaceProbeApi): ProbePanel {
             <textarea id="json" readonly></textarea>
           </section>
           <section>
-            <div class="dim">原生接口自检（可能弹出原生界面，谨慎点）</div>
-            <button id="getTitle">getTitle()</button>
-            <button id="getFirstImage">getFirstImage()</button>
-            <div id="nativeOut" class="dim"></div>
-          </section>
-          <section>
             <div class="dim">objectId 取图验证</div>
             <input id="objectId" placeholder="粘贴 objectId">
             <button id="fetch">取图</button>
@@ -910,7 +959,6 @@ function createPanel(api: FaceProbeApi): ProbePanel {
     const status = query<HTMLSpanElement>('status');
     const objectIdInput = query<HTMLInputElement>('objectId');
     const jsonBox = query<HTMLTextAreaElement>('json');
-    const nativeOut = query<HTMLDivElement>('nativeOut');
     const fetchOut = query<HTMLDivElement>('fetchOut');
 
     /** 把报告同步进文本框：没有检查器时，长按选中复制就是唯一的取回方式。 */
@@ -930,6 +978,10 @@ function createPanel(api: FaceProbeApi): ProbePanel {
             () => (status.textContent = '请长按文本框复制')
         );
     });
+    query<HTMLInputElement>('confirmRisky').checked = api.confirmRisky();
+    query<HTMLInputElement>('confirmRisky').addEventListener('change', (event) => {
+        api.confirmRisky((event.target as HTMLInputElement).checked);
+    });
     query<HTMLButtonElement>('rerun').addEventListener('click', () => void api.run());
     query<HTMLButtonElement>('stop').addEventListener('click', () => {
         api.stop();
@@ -938,12 +990,6 @@ function createPanel(api: FaceProbeApi): ProbePanel {
     query<HTMLButtonElement>('close').addEventListener('click', () => {
         api.stop();
         host.remove();
-    });
-    query<HTMLButtonElement>('getTitle').addEventListener('click', () => {
-        nativeOut.textContent = api.callNative('getTitle');
-    });
-    query<HTMLButtonElement>('getFirstImage').addEventListener('click', () => {
-        nativeOut.textContent = api.callNative('getFirstImage');
     });
     // 合成区按宿主能力显示：能力可能在面板建好之后才补进来，所以每次渲染都会重算。
     const syncComposeSection = (): void => {
@@ -980,6 +1026,8 @@ function createPanel(api: FaceProbeApi): ProbePanel {
     const renderReplacementEvents = (): void => {
         const section = query<HTMLElement>('replaceSection');
         if (section) section.hidden = !api.canReplace();
+        const button = query<HTMLButtonElement>('replace');
+        if (button) button.textContent = api.replacementInstalled() ? '关闭上报劫持' : '开启上报劫持';
         const out = query<HTMLDivElement>('replaceOut');
         if (!out) return;
         const events = (api.report()?.replacements ?? []).slice(-6).reverse();
@@ -1013,9 +1061,12 @@ function createPanel(api: FaceProbeApi): ProbePanel {
 
         query<HTMLDivElement>('steps').innerHTML = report.steps
             .map((step) => {
-                const replies = step.replies.length
-                    ? `<span class="ok">收到 ${step.replies.length} 条</span>`
-                    : '<span class="bad">无回复</span>';
+                const replies = step.skipped
+                    ? `<span class="bad">已跳过</span>`
+                    : step.replies.length
+                      ? `<span class="ok">收到 ${step.replies.length} 条</span>`
+                      : '<span class="bad">无回复</span>';
+                const skipped = step.skipped ? `<div class="bad">${step.skipped}</div>` : '';
                 const image = step.image && step.image.width
                     ? `<div>画面：${step.image.source} ${step.image.width}x${step.image.height}</div>
                        <img src="${step.image.loadUrl}">`
@@ -1026,7 +1077,7 @@ function createPanel(api: FaceProbeApi): ProbePanel {
                 const payload = step.replies.length
                     ? `<pre>${JSON.stringify(step.replies.map((reply) => ({ t: reply.type, ms: reply.elapsedMs, p: reply.payload }))).slice(0, 700)}</pre>`
                     : '';
-                return `<div style="margin-bottom:8px"><div>${step.label} ${replies}</div>${image}${error}${payload}</div>`;
+                return `<div style="margin-bottom:8px"><div>${step.label} ${replies}</div>${skipped}${image}${error}${payload}</div>`;
             })
             .join('') || '<div class="dim">等待开始</div>';
 
