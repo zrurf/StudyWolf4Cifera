@@ -48,8 +48,8 @@ const FACE_PROTOCOLS = new Set(['CLIENT_FACE_COLLECTION', 'CLIENT_FACE_RECOGNITI
 
 /** 合成器：拿到真实人脸画面（可能为空）后产出整屏伪造帧。 */
 export type FrameComposer = (face: HTMLImageElement | null) => Promise<HTMLCanvasElement>;
-/** 上传器：把伪造帧送上去，换回 objectId。 */
-export type FrameUploader = (frame: Blob) => Promise<MonitorUploadResult>;
+/** 上传器：把伪造帧送上去，换回 objectId；第二个参数是触发的协议名。 */
+export type FrameUploader = (frame: Blob, protocol: string) => Promise<MonitorUploadResult>;
 
 /** 一次替换的结果，供面板与日志展示。 */
 export interface ReplacementEvent {
@@ -100,8 +100,13 @@ const REPLAYED = new WeakSet<object>();
 let runtime: ReplacementRuntime | null = null;
 let removeRequestTap: (() => void) | null = null;
 let removeReplyTap: (() => void) | null = null;
-/** 页面最近一次监控请求带来的上传上下文。 */
-let harvested: HarvestedUpload | null = null;
+/**
+ * 页面最近一次监控请求带来的上传上下文，**按协议分开记**。
+ *
+ * 截屏、抓拍、人脸三条链路的 `uploadConfig.uploadUrl` 可能不同（后端按业务注入），共用一个"最后一条"
+ * 会把上一场次/另一业务的地址串过来。
+ */
+const harvestedByProtocol = new Map<string, HarvestedUpload>();
 /** 串行队列：避免多次抓拍同时合成/上传把 CPU 打满。 */
 let queue: Promise<void> = Promise.resolve();
 /** 排队中的任务数；积压太多就直接放行原包。 */
@@ -125,11 +130,19 @@ function emit(event: ReplacementEvent): void {
 }
 
 /** 给 Promise 加超时，避免合成或上传卡住后监控回复永远不发。 */
-function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
-    return Promise.race([
-        promise,
-        new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${what}超时`)), ms))
-    ]);
+async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${what}超时`)), ms);
+            })
+        ]);
+    } finally {
+        // 成功路径也要清掉定时器，否则它会一直挂在事件循环里。
+        clearTimeout(timer);
+    }
 }
 
 /** 把 Blob 读成不带前缀的 base64。 */
@@ -183,9 +196,10 @@ async function defaultCompose(face: HTMLImageElement | null): Promise<HTMLCanvas
 }
 
 /** 默认上传器：页面给的地址优先，`puid` 先看页面再问客户端。 */
-async function defaultUpload(frame: Blob): Promise<MonitorUploadResult> {
+async function defaultUpload(frame: Blob, protocol: string): Promise<MonitorUploadResult> {
     const puid = await resolveUploadPuid();
     const pageContext = pageUploadContext();
+    const harvested = harvestedByProtocol.get(protocol) ?? null;
     return uploadMonitorFrame(frame, {
         ...pageContext,
         uploadUrl: harvested?.uploadUrl ?? pageContext.uploadUrl,
@@ -214,7 +228,7 @@ async function replaceOnce(protocol: string, payload: Record<string, unknown>): 
         const face = FACE_PROTOCOLS.has(protocol) ? await faceFromPayload(payload) : null;
         const canvas = await withTimeout(rt.compose(face), rt.timeoutMs, '合成');
         const blob = await withTimeout(frameToJpegBlob(canvas, 0.9), rt.timeoutMs, '编码');
-        const result = await withTimeout(rt.upload(blob), rt.timeoutMs, '上传');
+        const result = await withTimeout(rt.upload(blob, protocol), rt.timeoutMs, '上传');
         if (!result.ok || !result.objectId) {
             throw new Error(result.body || `上传未返回 objectId（HTTP ${result.status}）`);
         }
@@ -277,7 +291,7 @@ export function installMonitorFrameReplacement(options: MonitorReplacementOption
         dropSignature: options.dropSignature !== false,
         objectIdUrl: options.objectIdUrl ?? DEFAULT_OBJECT_ID_URL
     };
-    harvested = null;
+    harvestedByProtocol.clear();
 
     removeRequestTap = jsBridge.use(
         'prePostNotification',
@@ -287,7 +301,7 @@ export function installMonitorFrameReplacement(options: MonitorReplacementOption
                 const fetched = harvestUploadContext([args.payload]);
                 // 只有真的带来上传信息时才记住，避免把上一场次的地址留在手里。
                 if (Object.keys(fetched.params).length > 0 || fetched.uploadUrl) {
-                    harvested = fetched;
+                    harvestedByProtocol.set(args.name, fetched);
                 }
             }
             next();
