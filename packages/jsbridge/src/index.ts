@@ -89,12 +89,15 @@ const monitorHijackDisabled = (() => {
 if (!monitorHijackDisabled) installMonitorFrameReplacement();
 
 /**
- * 人脸悬浮窗探针。
+ * 人脸悬浮窗探针：**默认完全关闭**。
  *
- * 默认不运行：只有 `localStorage['sw4c-face-probe'] = '1'` 或 URL 里带 `sw4c_face_probe`
- * 时才自动开始。需要单独注入时用 `dist/face-probe.js`。
+ * 关着的状态下不建面板、不记录流量、不写 localStorage，页面里也不会出现 `__SW4C_FACE_PROBE__`。
+ * 需要时三选一：
+ * 1. `localStorage['sw4c-face-probe'] = '1'`（或 URL 带 `sw4c_face_probe`）后刷新；
+ * 2. 注入 `dist/jsbridge-probe.js`（bridge + 探针，注入即运行）；
+ * 3. 控制台里 `__STUDY_WOLF__.installFaceProbe({ panel: true })`。
  */
-const faceProbe = installFaceProbe();
+const faceProbe = faceProbeEnabled() ? installFaceProbe({ autoRun: true, panel: true }) : null;
 
 /**
  * 控制台 API。
@@ -115,6 +118,7 @@ const faceProbe = installFaceProbe();
     dumpBridgeLog,
     clearBridgeLog,
     faceProbe,
+    installFaceProbe,
     installMonitorFrameReplacement,
     uninstallMonitorFrameReplacement,
     isMonitorReplacementInstalled,

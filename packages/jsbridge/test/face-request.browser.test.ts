@@ -248,6 +248,54 @@ describe('requestFaceFrame 的取图失败降级', () => {
     }, 30_000);
 });
 
+describe('生产产物的探针默认状态', () => {
+    test('默认不安装探针：无面板、无 __SW4C_FACE_PROBE__，但保留手动安装入口', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.goto(`${ORIGIN()}/`);
+        await target.waitForFunction(() => (window as any).__Lib__ !== undefined);
+        // 给异步的 ensureReady 一点时间，确认它确实没建面板。
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        const state = await target.evaluate(() => ({
+            api: typeof (window as any).__SW4C_FACE_PROBE__,
+            panels: document.querySelectorAll('#sw4c-face-probe-panel').length,
+            storedReport: localStorage.getItem('sw4c-face-probe-report'),
+            install: typeof (window as any).__STUDY_WOLF__?.installFaceProbe,
+            replacement: (window as any).__STUDY_WOLF__?.isMonitorReplacementInstalled?.()
+        }));
+
+        expect(state.api).toBe('undefined');
+        expect(state.panels).toBe(0);
+        // 连流量记录都不该启动，也就不该写报告。
+        expect(state.storedReport).toBeNull();
+        expect(state.install).toBe('function');
+        // 上报替换仍然常驻，两者互不影响。
+        expect(state.replacement).toBe(true);
+        await target.close();
+    }, 30_000);
+
+    test('开关置位后才安装探针并显示面板', async () => {
+        const target = await browser.newPage({ viewport: { width: 360, height: 679 } });
+        await target.addInitScript(() => {
+            localStorage.setItem('sw4c-face-probe', '1');
+            (window as any).confirm = () => false;
+        });
+        await target.goto(`${ORIGIN()}/`);
+        await target.waitForFunction(() => (window as any).__SW4C_FACE_PROBE__ !== undefined, null, {
+            timeout: 10_000
+        });
+        await target.waitForFunction(() => !!document.getElementById('sw4c-face-probe-panel'), null, {
+            timeout: 10_000
+        });
+
+        const panels = await target.evaluate(
+            () => document.querySelectorAll('#sw4c-face-probe-panel').length
+        );
+        expect(panels).toBe(1);
+        await target.close();
+    }, 30_000);
+});
+
 describe('键盘限制拦截', () => {
     test('CLIENT_LIMIT_KEYBOARD 不抵达客户端，并补一个 {result:1} 回包', async () => {
         const target = await browser.newPage({ viewport: { width: 360, height: 679 } });

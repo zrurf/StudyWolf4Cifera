@@ -46,7 +46,8 @@ bun run build   # 构建
 - [x] 解除键盘禁用
 - [x] 截屏/抓拍/人脸三类监控回复的画面替换：合成伪造帧、自行上传、改写回调里的图片引用
 - [x] 摄像头画面不伪造：悬浮窗取客户端真实采集（人脸回复里的真实画面会复用为窗口内容）
-- [x] 真机诊断探针（`dist/jsbridge-probe.js`，注入即运行；正式产物 `dist/jsbridge.js` 不含面板）
+- [x] 真机诊断探针（`dist/jsbridge-probe.js`，注入即运行；正式产物 `dist/jsbridge.js` 默认**不安装探针**，
+      需要时设 `localStorage['sw4c-face-probe']='1'` 刷新，或控制台 `__STUDY_WOLF__.installFaceProbe({panel:true})`）
 
 替换只改页面收到的图片引用，**不阻止客户端自己上传原始截图**（那条链路在 native 侧，JS 无法拦截），
 也不是连续视频流替换。任何一步失败都会把客户端原始回复原样放回；需要临时关闭时设
